@@ -1,0 +1,22 @@
+# venv & caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# env & local config
+.env
+
+# logs & coverage
+*.log
+.coverage
+htmlcov/
+
+# editor
+.vscode/
+.idea/
+
+# local cache files
+cache_*.json
