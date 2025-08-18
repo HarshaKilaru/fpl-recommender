@@ -86,4 +86,4 @@ pytest -q
 - Import current squad to auto-exclude + adjust budget
 
 ## License
-MIT — see `LICENSE` (or `LICENSE.txt`).
+MIT — see `LICENSE` 
