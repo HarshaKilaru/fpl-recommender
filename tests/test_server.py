@@ -1,5 +1,5 @@
 from fastapi.testclient import TestClient
-from src.fpl_recommender.server import app
+from fpl_recommender.server import app  # <- changed
 
 def test_health():
     client = TestClient(app)
