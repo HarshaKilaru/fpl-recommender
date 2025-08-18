@@ -1,6 +1,6 @@
 FPL Recommender
 
-[![CI](https://github.com/<USER>/fpl-recommender/actions/workflows/ci.yml/badge.svg)](https://github.com/<USER>/fpl-recommender/actions/workflows/ci.yml)
+[![CI](https://github.com/HarshaKilaru/fpl-recommender/actions/workflows/ci.yml/badge.svg)](https://github.com/<USER>/fpl-recommender/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10-blue)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
