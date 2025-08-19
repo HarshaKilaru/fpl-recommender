@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>FPL Recommender</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root { --ring: rgba(59,130,246,.5); }
+    html, body { height: 100%; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
+    .focus-ring:focus { outline: 2px solid var(--ring); outline-offset: 2px; }
+    .chip { transition: transform .05s ease; }
+    .chip:active { transform: scale(.98); }
+    .skeleton { background: linear-gradient(90deg, #f3f4f6 25%, #e5e7eb 37%, #f3f4f6 63%); background-size: 400% 100%; animation: shine 1.4s ease infinite; }
+    @keyframes shine { 0% {background-position: 100% 0} 100% {background-position: 0 0} }
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-900">
+  <header class="border-b bg-white/70 backdrop-blur">
+    <div class="mx-auto max-w-6xl px-4 py-4 flex items-center justify-between">
+      <h1 class="text-xl font-semibold tracking-tight">FPL Recommender</h1>
+      <a href="https://fantasy.premierleague.com" target="_blank" class="text-sm text-gray-500 hover:text-gray-700">Data powered by FPL</a>
+    </div>
+  </header>
+
+  <main class="mx-auto max-w-6xl p-4 md:p-6 grid gap-6 md:grid-cols-3">
+    <!-- Controls -->
+    <section class="md:col-span-1">
+      <div class="bg-white rounded-xl shadow-sm ring-1 ring-gray-200 p-4 md:p-5 space-y-5">
+        <h2 class="text-base font-semibold">Build your query</h2>
+
+        <!-- Budget / caps -->
+        <div class="space-y-3">
+          <label class="block text-sm font-medium">Budget (millions)</label>
+          <input id="budget" type="number" step="0.1" min="0" value="12.5"
+                 class="w-full focus-ring rounded-lg border-gray-300 focus:border-blue-500">
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-sm font-medium">Max/team</label>
+            <input id="maxTeam" type="number" min="1" max="3" value="3"
+                   class="w-full focus-ring rounded-lg border-gray-300 focus:border-blue-500">
+          </div>
+          <div>
+            <label class="block text-sm font-medium">Min form</label>
+            <input id="minForm" type="number" min="0" step="0.1" value="0"
+                   class="w-full focus-ring rounded-lg border-gray-300 focus:border-blue-500">
+          </div>
+        </div>
+
+        <!-- Needs builder -->
+        <div class="space-y-3">
+          <label class="block text-sm font-medium">Needs</label>
+          <div class="grid grid-cols-5 gap-2">
+            <select id="posSelect" class="col-span-3 focus-ring rounded-lg border-gray-300">
+              <option value="GK">GK — Goalkeeper</option>
+              <option value="DEF">DEF — Defender</option>
+              <option value="MID" selected>MID — Midfielder</option>
+              <option value="FWD">FWD — Forward</option>
+            </select>
+            <select id="countSelect" class="col-span-2 focus-ring rounded-lg border-gray-300">
+              <option>1</option><option>2</option><option>3</option><option>4</option><option>5</option>
+            </select>
+          </div>
+          <button id="addNeed" class="focus-ring w-full rounded-lg bg-blue-600 px-3 py-2 text-white font-medium hover:bg-blue-700 active:bg-blue-800">
+            + Add
+          </button>
+
+          <div id="needChips" class="flex flex-wrap gap-2 pt-1" aria-live="polite"></div>
+
+          <p id="needHint" class="text-xs text-gray-500">
+            Tip: add multiple entries (e.g., <span class="font-medium">DEF ×2</span> and <span class="font-medium">MID ×1</span>).
+          </p>
+        </div>
+
+        <!-- Exclude -->
+        <div class="space-y-3">
+          <label class="block text-sm font-medium">Exclude players (comma separated)</label>
+          <input id="exclude" type="text" placeholder="e.g., Haaland, Salah"
+                 class="w-full focus-ring rounded-lg border-gray-300 focus:border-blue-500">
+        </div>
+
+        <!-- Actions -->
+        <div class="flex items-center gap-3">
+          <button id="runBtn" class="flex-1 focus-ring rounded-lg bg-emerald-600 px-3 py-2 text-white font-medium hover:bg-emerald-700 active:bg-emerald-800">
+            Recommend
+          </button>
+          <button id="resetBtn" class="focus-ring rounded-lg px-3 py-2 text-gray-600 hover:bg-gray-100">
+            Reset
+          </button>
+        </div>
+      </div>
+
+      <!-- Small footnote -->
+      <p class="mt-3 text-xs text-gray-500">
+        This UI sends a request like <code>need=DEF:2,MID:1</code>. If your backend expects numbered slots (e.g., <code>2:1,3:1</code>), change the mapper in <code>buildQuery()</code>.
+      </p>
+    </section>
+
+    <!-- Results -->
+    <section class="md:col-span-2">
+      <div class="bg-white rounded-xl shadow-sm ring-1 ring-gray-200 p-4 md:p-5">
+        <div class="flex items-center justify-between">
+          <h2 class="text-base font-semibold">Recommendations</h2>
+          <div id="resultMeta" class="text-sm text-gray-500"></div>
+        </div>
+
+        <div id="emptyState" class="mt-8 rounded-lg border border-dashed border-gray-300 p-6 text-center">
+          <p class="text-sm text-gray-600">Set your needs and hit <span class="font-semibold">Recommend</span> to see players.</p>
+        </div>
+
+        <div id="skeleton" class="mt-6 hidden grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <!-- three skeleton cards -->
+          <div class="rounded-lg border p-4 space-y-3">
+            <div class="h-5 w-2/3 skeleton rounded"></div>
+            <div class="h-4 w-1/3 skeleton rounded"></div>
+            <div class="h-4 w-full skeleton rounded"></div>
+            <div class="h-20 w-full skeleton rounded"></div>
+          </div>
+          <div class="rounded-lg border p-4 space-y-3">
+            <div class="h-5 w-2/3 skeleton rounded"></div>
+            <div class="h-4 w-1/3 skeleton rounded"></div>
+            <div class="h-4 w-full skeleton rounded"></div>
+            <div class="h-20 w-full skeleton rounded"></div>
+          </div>
+          <div class="rounded-lg border p-4 space-y-3">
+            <div class="h-5 w-2/3 skeleton rounded"></div>
+            <div class="h-4 w-1/3 skeleton rounded"></div>
+            <div class="h-4 w-full skeleton rounded"></div>
+            <div class="h-20 w-full skeleton rounded"></div>
+          </div>
+        </div>
+
+        <div id="results" class="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    // ---------- CONFIG ----------
+    const API_URL = "/api/recommend"; // <-- change to your endpoint
+    // If your backend expects numeric positions, edit this map and buildQuery()
+    const POS_TO_NUM = { GK: 1, DEF: 2, MID: 3, FWD: 4 };
+
+    // ---------- STATE ----------
+    const needs = new Map(); // position -> count
+    const els = {
+      posSelect: document.getElementById("posSelect"),
+      countSelect: document.getElementById("countSelect"),
+      addNeed: document.getElementById("addNeed"),
+      needChips: document.getElementById("needChips"),
+      needHint: document.getElementById("needHint"),
+      budget: document.getElementById("budget"),
+      maxTeam: document.getElementById("maxTeam"),
+      minForm: document.getElementById("minForm"),
+      exclude: document.getElementById("exclude"),
+      runBtn: document.getElementById("runBtn"),
+      resetBtn: document.getElementById("resetBtn"),
+      results: document.getElementById("results"),
+      resultMeta: document.getElementById("resultMeta"),
+      emptyState: document.getElementById("emptyState"),
+      skeleton: document.getElementById("skeleton"),
+    };
+
+    // ---------- HELPERS ----------
+    function renderChips() {
+      els.needChips.innerHTML = "";
+      if (needs.size === 0) {
+        els.needHint.classList.remove("hidden");
+        return;
+      }
+      els.needHint.classList.add("hidden");
+      for (const [pos, count] of needs.entries()) {
+        const chip = document.createElement("div");
+        chip.className = "chip inline-flex items-center gap-2 rounded-full bg-gray-100 px-3 py-1 text-sm";
+        chip.innerHTML = `
+          <span class="font-medium">${pos}</span>
+          <span class="text-gray-600">×${count}</span>
+          <button class="ml-1 rounded-full p-1 hover:bg-gray-200" aria-label="Remove ${pos}">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-gray-500" viewBox="0 0 20 20" fill="currentColor">
+              <path fill-rule="evenodd" d="M10 8.586l4.95-4.95 1.414 1.414L11.414 10l4.95 4.95-1.414 1.414L10 11.414l-4.95 4.95-1.414-1.414L8.586 10l-4.95-4.95L5.05 3.636 10 8.586z" clip-rule="evenodd"/>
+            </svg>
+          </button>`;
+        chip.querySelector("button").addEventListener("click", () => {
+          needs.delete(pos);
+          renderChips();
+        });
+        els.needChips.appendChild(chip);
+      }
+    }
+
+    function buildQuery() {
+      // Format A (human): DEF:2,MID:1
+      const needParam = Array.from(needs.entries()).map(([pos, cnt]) => `${pos}:${cnt}`).join(",");
+      const params = new URLSearchParams();
+      if (needParam) params.set("need", needParam);
+      if (els.budget.value) params.set("budget", els.budget.value);
+      if (els.maxTeam.value) params.set("max_from_team", els.maxTeam.value);
+      if (els.minForm.value) params.set("min_form", els.minForm.value);
+      if (els.exclude.value.trim()) params.set("exclude", els.exclude.value.trim());
+
+      // If your backend instead expects numeric positions like 2:1,3:1, use this:
+      // const needParamNumeric = Array.from(needs.entries())
+      //   .map(([pos, cnt]) => `${POS_TO_NUM[pos]}:${cnt}`).join(",");
+      // params.set("need", needParamNumeric);
+
+      return params.toString();
+    }
+
+    function showSkeleton(show) {
+      els.skeleton.classList.toggle("hidden", !show);
+    }
+    function showEmpty(show) {
+      els.emptyState.classList.toggle("hidden", !show);
+    }
+    function clearResults() {
+      els.results.innerHTML = "";
+      els.resultMeta.textContent = "";
+    }
+
+    function playerCard(p) {
+      const price = p.price ?? p.now_cost ?? p.cost ?? null;
+      const priceFmt = price ? (price >= 50 ? (price/10).toFixed(1) : Number(price).toFixed(1)) : "—";
+      const score = p.score ?? p.composite ?? p.form ?? "—";
+      const position = p.position ?? p.element_type_str ?? p.pos ?? "—";
+      const team = p.team ?? p.team_name ?? "—";
+
+      const fixtures = Array.isArray(p.fixtures) ? p.fixtures.slice(0, 3).map(f => {
+        const opp = f.opponent_short_name || f.opponent || f.opp || "?";
+        const h = f.is_home || f.home || f.H ? "H" : "A";
+        return `${opp} (${h})`;
+      }).join(" · ") : (p.next_fixture || "");
+
+      const el = document.createElement("article");
+      el.className = "rounded-lg border border-gray-200 p-4 hover:shadow-sm transition";
+      el.innerHTML = `
+        <div class="flex items-start justify-between gap-2">
+          <h3 class="text-base font-semibold">${p.name || p.web_name || "Player"}</h3>
+          <span class="rounded bg-gray-100 px-2 py-0.5 text-xs">${position}</span>
+        </div>
+        <p class="mt-1 text-sm text-gray-600">${team}</p>
+        <dl class="mt-3 grid grid-cols-3 gap-2 text-sm">
+          <div><dt class="text-gray-500">Price</dt><dd class="font-medium">£${priceFmt}m</dd></div>
+          <div><dt class="text-gray-500">Score</dt><dd class="font-medium">${score}</dd></div>
+          <div><dt class="text-gray-500">ICT</dt><dd class="font-medium">${p.ict_index ?? "—"}</dd></div>
+        </dl>
+        ${fixtures ? `<div class="mt-3 rounded bg-gray-50 p-2 text-xs text-gray-700"><span class="text-gray-500">Next:</span> ${fixtures}</div>` : ""}
+      `;
+      return el;
+    }
+
+    function renderResults(items) {
+      clearResults();
+      if (!items || items.length === 0) {
+        showEmpty(true);
+        return;
+      }
+      showEmpty(false);
+      const frag = document.createDocumentFragment();
+      items.forEach(p => frag.appendChild(playerCard(p)));
+      els.results.appendChild(frag);
+      els.resultMeta.textContent = `${items.length} result${items.length !== 1 ? "s" : ""}`;
+    }
+
+    function mockResults() {
+      return [
+        { name: "Jarrod Bowen", team: "WHU", position: "MID", price: 8.0, score: 83, ict_index: 10.2, fixtures: [{opponent_short_name:"BRE",is_home:true},{opponent_short_name:"AVL",is_home:false}] },
+        { name: "Ben Chilwell", team: "CHE", position: "DEF", price: 5.5, score: 71, ict_index: 7.6, fixtures: [{opponent_short_name:"NEW",is_home:false},{opponent_short_name:"BHA",is_home:true}] },
+        { name: "Mark Flekken", team: "BRE", position: "GK", price: 4.5, score: 60, ict_index: 2.3, fixtures: [{opponent_short_name:"WHU",is_home:false},{opponent_short_name:"EVE",is_home:true}] },
+      ];
+    }
+
+    // ---------- EVENTS ----------
+    els.addNeed.addEventListener("click", () => {
+      const pos = els.posSelect.value;
+      const count = parseInt(els.countSelect.value, 10);
+      needs.set(pos, count); // overwrite per-pos (clearer for users)
+      renderChips();
+    });
+
+    els.resetBtn.addEventListener("click", () => {
+      needs.clear(); renderChips();
+      els.budget.value = 12.5;
+      els.maxTeam.value = 3;
+      els.minForm.value = 0;
+      els.exclude.value = "";
+      clearResults(); showEmpty(true);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+
+    els.runBtn.addEventListener("click", async () => {
+      clearResults(); showEmpty(false); showSkeleton(true);
+      try {
+        const qs = buildQuery();
+        const res = await fetch(`${API_URL}?${qs}`);
+        if (!res.ok) throw new Error("API error");
+        const data = await res.json();
+        // expect array or {results: []}
+        const items = Array.isArray(data) ? data : (data.results || []);
+        renderResults(items);
+      } catch (e) {
+        // graceful fallback so you can see the UI right away
+        renderResults(mockResults());
+      } finally {
+        showSkeleton(false);
+      }
+      // store last query locally for QoL
+      localStorage.setItem("fpl_needs", JSON.stringify(Array.from(needs.entries())));
+      localStorage.setItem("fpl_budget", els.budget.value);
+      localStorage.setItem("fpl_maxTeam", els.maxTeam.value);
+      localStorage.setItem("fpl_minForm", els.minForm.value);
+      localStorage.setItem("fpl_exclude", els.exclude.value);
+    });
+
+    // ---------- INIT ----------
+    (() => {
+      try {
+        const saved = localStorage.getItem("fpl_needs");
+        if (saved) {
+          const arr = JSON.parse(saved); arr.forEach(([pos, cnt]) => needs.set(pos, cnt));
+        } else {
+          needs.set("MID", 1); // sensible default
+        }
+        renderChips();
+        els.budget.value = localStorage.getItem("fpl_budget") ?? 12.5;
+        els.maxTeam.value = localStorage.getItem("fpl_maxTeam") ?? 3;
+        els.minForm.value = localStorage.getItem("fpl_minForm") ?? 0;
+        els.exclude.value = localStorage.getItem("fpl_exclude") ?? "";
+      } catch {}
+    })();
+  </script>
+</body>
+</html>
