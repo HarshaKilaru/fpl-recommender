@@ -1,249 +1,382 @@
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
-from typing import Set, Dict
-import pandas as pd
-import numpy as np
-import math
-import io, csv
+# src/fpl_recommender/server.py
+from __future__ import annotations
 
-from .data.fpl_api import fetch_bootstrap_static, fetch_fixtures, throttle
-from .features.ranker import build_player_frame, recommend
-from .utils.cache import cache_json
+import csv
+import io
+import inspect
+import logging
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Dict, List, Sequence
 
-app = FastAPI(title="FPL Recommender API", version="1.0.0")
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 
-# ---------------- Home (minimal UI) ----------------
-@app.get("/", response_class=HTMLResponse)
-def root():
-    return """<!doctype html>
-<html><head><meta charset="utf-8"><title>FPL Recommender</title>
-<style>
- body{font-family:system-ui,Arial;margin:24px;max-width:1000px}
- .row{display:flex;gap:12px;flex-wrap:wrap;margin:8px 0}
- label{display:flex;flex-direction:column;font-size:12px}
- input{padding:8px 10px;font-size:14px}
- button{padding:10px 14px;font-size:14px;cursor:pointer}
- table{border-collapse:collapse;width:100%;margin-top:16px}
- th,td{border:1px solid #ddd;padding:8px;font-size:14px;text-align:left}
- th{background:#f3f4f6}
- .hint{font-size:12px;color:#666;margin-top:4px}
- .meta{margin-top:10px;color:#333}
- .err{color:#b91c1c;margin-top:10px}
- .actions{display:flex;gap:10px;margin-top:10px}
-</style></head>
-<body>
-<h1>FPL Recommender</h1>
-<div class="row">
-  <label>Budget (£m)
-    <input id="budget" type="number" step="0.1" value="12.5">
-  </label>
-  <label>Need (1=GK,2=DEF,3=MID,4=FWD)
-    <input id="need" type="text" value="2:1,3:1">
-    <div class="hint">Format: 2:1,3:1 → 1 DEF, 1 MID</div>
-  </label>
-  <label>Exclude IDs (comma-sep)
-    <input id="exclude" type="text" placeholder="e.g. 123,456">
-  </label>
-  <label>Max from team
-    <input id="max_from_team" type="number" min="1" max="3" value="3">
-  </label>
-  <label>Top per position
-    <input id="top_per_pos" type="number" min="1" max="100" value="30">
-  </label>
-</div>
-<div class="actions">
-  <button id="go">Get recommendations</button>
-  <a id="csv" href="#" download="recommendations.csv">Download CSV</a>
-</div>
-<div id="status" class="meta"></div>
-<div id="error" class="err"></div>
-<div id="results"></div>
-<script>
-const el = id => document.getElementById(id);
-function currentParams(){
-  return new URLSearchParams({
-    budget: el("budget").value,
-    need: el("need").value,
-    exclude: el("exclude").value,
-    max_from_team: el("max_from_team").value,
-    top_per_pos: el("top_per_pos").value
-  });
-}
-async function fetchRecs() {
-  el("error").textContent=""; el("status").textContent="Fetching…"; el("results").innerHTML="";
-  const btn=el("go"); btn.disabled=true;
-  const params = currentParams();
-  el("csv").href = "/recommend.csv?"+params.toString();
-  try {
-    const res = await fetch("/recommend?"+params.toString());
-    const data = await res.json();
-    if (!res.ok) throw new Error((data && data.detail) || "Request failed");
-    const recs = data.recommendations || [];
-    el("status").textContent = `Found ${data.count||recs.length} picks · Spend: £${(data.spent||0).toFixed(2)}m`;
-    if (!recs.length){ el("results").innerHTML="<p>No valid recommendations.</p>"; return; }
-    const headers=["id","web_name","team_name","pos","price","score","form","points_per_game","fixture_outlook","chance_of_playing_next_round","value"];
-    let html="<table><thead><tr>"+headers.map(h=>"<th>"+h.replaceAll("_"," ")+"</th>").join("")+"</tr></thead><tbody>";
-    for(const r of recs){ html+="<tr>"+headers.map(h=>`<td>${r[h]??""}</td>`).join("")+"</tr>"; }
-    html+="</tbody></table>"; el("results").innerHTML=html;
-  } catch(e){ el("error").textContent="Error: "+e.message; }
-  finally{ btn.disabled=false; }
-}
-el("go").addEventListener("click", fetchRecs);
-</script>
-</body></html>"""
+# ----------------------------- Logging ---------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("fpl.server")
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+# -------------------------- Your recommender ---------------------------------
+try:
+    from src.fpl_recommender.features.ranker import recommend  # type: ignore
+    log.info("Using recommender: src.fpl_recommender.features.ranker.recommend")
+except Exception as e:
+    recommend = None  # type: ignore
+    log.error("Failed to import recommender: %s", e)
 
-# ---------------- Helpers ----------------
-def _parse_positions(s: str) -> Dict[int, int]:
+# ----------------------------- Data loader -----------------------------------
+def _build_df_from_fpl_api():
+    import pandas as pd  # defer import
+    from src.fpl_recommender.data.fpl_api import fetch_bootstrap_static, fetch_fixtures, throttle
+
+    log.info("Fetching bootstrap-static …")
+    boot = fetch_bootstrap_static()
+    throttle(0.2)
+    log.info("Fetching fixtures …")
+    _ = fetch_fixtures()  # not required for columns we add here
+
+    elements = boot.get("elements", [])
+    teams = boot.get("teams", [])
+
+    df = pd.DataFrame(elements)
+
+    if "id" not in df.columns:
+        raise RuntimeError("Loader failed: DataFrame missing required 'id' column")
+
+    # ----- Position columns -----
+    pos_map = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+    if "element_type" in df.columns:
+        df["position_id"] = df["element_type"]
+        df["pos"] = df["element_type"].map(pos_map).fillna("UNK")
+    else:
+        df["position_id"] = 0
+        df["pos"] = "UNK"
+
+    # ----- Team short name -----
+    if teams and "team" in df.columns:
+        team_df = pd.DataFrame(teams)[["id", "short_name", "name"]].rename(
+            columns={"id": "team_id", "short_name": "team_short", "name": "team_name"}
+        )
+        df = df.merge(team_df, left_on="team", right_on="team_id", how="left") \
+               .drop(columns=[c for c in ("team_id",) if c in df.columns])
+
+    # ----- Player name helpers (nice to have) -----
+    if "web_name" in df.columns and "second_name" in df.columns:
+        df["display_name"] = df["web_name"]
+        df["full_name"] = df.get("first_name", "") + " " + df.get("second_name", "")
+    elif "web_name" in df.columns:
+        df["display_name"] = df["web_name"]
+
+    # ----- Ensure numeric fields + composite score -----
+    def _to_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
+    # price expected by ranker; FPL's now_cost is in tenths of a million
+    if "price" not in df.columns:
+        if "now_cost" in df.columns:
+            df["price"] = df["now_cost"].map(_to_float) / 10.0
+        else:
+            df["price"] = 0.0
+
+    if "score" not in df.columns:
+        form = df["form"].map(_to_float) if "form" in df.columns else 0.0
+        ppg = df["points_per_game"].map(_to_float) if "points_per_game" in df.columns else 0.0
+        ict = df["ict_index"].map(_to_float) if "ict_index" in df.columns else 0.0
+        df["score"] = (0.45 * ppg) + (0.35 * form) + (0.20 * (ict / 10.0))
+
+    log.info("Loaded players df: %s rows, %s cols", len(df), len(df.columns))
+    return df
+
+
+@lru_cache(maxsize=1)
+def _get_df():
+    return _build_df_from_fpl_api()
+
+
+def _reload_df():
+    _get_df.cache_clear()  # type: ignore[attr-defined]
+    _get_df()
+
+
+# ---------------------------- FastAPI + Static UI ----------------------------
+app = FastAPI(title="FPL Recommender", version="1.9")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+HERE = Path(__file__).resolve()
+SRC_DIR = HERE.parent
+REPO_ROOT = SRC_DIR.parent.parent if SRC_DIR.name == "fpl_recommender" else SRC_DIR.parent
+STATIC_DIR = REPO_ROOT / "static"
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+
+
+@app.get("/", include_in_schema=False)
+def ui_root() -> FileResponse:
+    index = STATIC_DIR / "index.html"
+    if not index.exists():
+        raise HTTPException(status_code=404, detail="Missing UI: create 'static/index.html' at the repo root.")
+    return FileResponse(index)
+
+
+@app.get("/health", include_in_schema=False)
+def health() -> Dict[str, Any]:
+    ok_df = True
+    try:
+        df = _get_df()
+        ok_df = df is not None
+    except Exception:
+        ok_df = False
+    return {
+        "ok": True,
+        "ui": (STATIC_DIR / "index.html").exists(),
+        "recommender_found": bool(recommend),
+        "df_loaded": ok_df,
+    }
+
+
+@app.post("/reload-data", include_in_schema=False)
+def reload_data() -> Dict[str, Any]:
+    try:
+        _reload_df()
+        return {"ok": True, "reloaded": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Reload failed: {e}")
+
+
+# --------------------------------- Helpers -----------------------------------
+def _parse_positions(need: str) -> Dict[int, int]:
+    need = (need or "").replace(";", ",").strip()
+    if not need:
+        return {}
     out: Dict[int, int] = {}
-    s = (s or "").strip()
-    if not s:
-        return out
-    for chunk in s.split(","):
-        k, v = chunk.split(":")
-        out[int(k)] = int(v)
+    parts = [p.strip() for p in need.split(",") if p.strip()]
+    for p in parts:
+        if ":" not in p:
+            try:
+                pos = int(p)
+                out[pos] = out.get(pos, 0) + 1
+            except ValueError:
+                continue
+            continue
+        k, v = p.split(":", 1)
+        try:
+            pos = int(k.strip())
+            count = int(float(v.strip()))
+            if count > 0:
+                out[pos] = out.get(pos, 0) + count
+        except ValueError:
+            continue
     return out
 
-def _parse_ids(s: str) -> Set[int]:
-    if not s:
-        return set()
-    return {int(x.strip()) for x in s.split(",") if x.strip()}
 
-# ---------------- Search players by name ----------------
-@app.get("/search")
-def search_players(query: str = Query(..., min_length=2)):
+def _parse_ids(exclude: str) -> List[int]:
+    if not exclude:
+        return []
+    exclude = exclude.replace(";", ",")
+    ids = []
+    for tok in exclude.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            ids.append(int(tok))
+        except ValueError:
+            continue
+    return ids
+
+
+def _normalize_rows(obj) -> List[Dict[str, Any]]:
+    if isinstance(obj, list) and (not obj or isinstance(obj[0], dict)):
+        return obj
     try:
-        bootstrap = cache_json("cache_bootstrap.json", 15*60, fetch_bootstrap_static)
-        df = build_player_frame(bootstrap, [])
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search failed: {e}")
-    q = query.strip().lower()
-    sub = df[df["web_name"].str.lower().str.contains(q, na=False)].copy()
-    sub = sub[["id","web_name","team_name","pos","price","form","points_per_game"]].head(25)
-    for c in ["price","form","points_per_game"]:
-        sub[c] = pd.to_numeric(sub[c], errors="coerce").fillna(0).round(2)
-    return {"results": sub.to_dict(orient="records")}
+        import pandas as pd  # type: ignore
+        if isinstance(obj, pd.DataFrame):  # type: ignore
+            return obj.to_dict(orient="records")  # type: ignore
+    except Exception:
+        pass
+    if isinstance(obj, tuple) and obj:
+        return _normalize_rows(obj[0])
+    if obj is None:
+        return []
+    return [{"value": str(obj)}]
 
-# ---------------- Recommend (JSON) ----------------
+
+def _to_csv(rows: Sequence[Dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+    cols = list(rows[0].keys())
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=cols)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: r.get(k, "") for k in cols})
+    return buf.getvalue()
+
+
+def _wants_csv(request: Request, fmt: str | None) -> bool:
+    if fmt and fmt.lower() == "csv":
+        return True
+    accept = request.headers.get("accept", "")
+    return "text/csv" in accept.lower()
+
+
+# --------- Build kwargs dynamically to match your recommender signature -------
+_ALIAS_GROUPS = {
+    "df": ["df", "data", "players_df", "players", "dataset"],
+    "budget": ["budget", "total_budget"],
+    "need_positions": ["need_positions", "need", "positions_needed", "positions"],
+    "exclude_ids": ["exclude_ids", "exclude", "exclude_list", "exclude_players"],
+    "max_from_team": ["max_from_team", "max_per_team", "team_limit"],
+    # only passed if present in your recommender signature
+    "top_per_pos": ["top_per_pos", "top_per_position", "top_n_per_pos", "top_n", "top_k", "limit"],
+}
+
+import math
+from typing import Mapping
+
+def _json_sanitize(obj):
+    """Recursively convert NaN/Inf -> None and numpy/pandas scalars -> py scalars."""
+    # numpy / pandas scalars
+    try:
+        import numpy as np  # type: ignore
+        if isinstance(obj, np.generic):  # type: ignore
+            obj = obj.item()
+    except Exception:
+        pass
+
+    # primitives
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if obj is None or isinstance(obj, (int, str, bool)):
+        return obj
+
+    # containers
+    if isinstance(obj, Mapping):
+        return {k: _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_sanitize(v) for v in obj]
+
+    # everything else -> string
+    return str(obj)
+
+# --- add near other helpers ---
+def _compact_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a raw row to the minimal fields we want for the UI."""
+    # names
+    name = r.get("display_name") or r.get("web_name") or r.get("second_name") or r.get("full_name") or r.get("name")
+
+    # team / position
+    team = r.get("team_short") or r.get("team_name") or r.get("team")
+    pos  = r.get("pos") or r.get("position") or r.get("position_name")
+
+    # numbers
+    def f(x, dp=2):
+        try:
+            return round(float(x), dp)
+        except Exception:
+            return None
+
+    return {
+        "name": name,
+        "team": team,
+        "pos": pos,
+        "price": f(r.get("price"), 1),
+        "form": f(r.get("form")),
+        "ppg": f(r.get("points_per_game")),
+        "score": f(r.get("score")),
+        # keep raw id if present (handy for debugging/links; hidden in UI)
+        "id": r.get("id"),
+    }
+
+def _adapt_and_call_recommend(df, budget, need_positions, exclude_ids, max_from_team, top_per_pos):
+    if recommend is None:
+        raise RuntimeError("Recommender not found")
+
+    params = set(inspect.signature(recommend).parameters.keys())  # type: ignore[arg-type]
+
+    raw_values = {
+        "df": df,
+        "budget": budget,
+        "need_positions": need_positions,
+        "exclude_ids": exclude_ids,
+        "max_from_team": max_from_team,
+        "top_per_pos": top_per_pos,
+    }
+
+    kwargs: Dict[str, Any] = {}
+    used_map: Dict[str, str] = {}
+
+    for canonical, aliases in _ALIAS_GROUPS.items():
+        for name in aliases:
+            if name in params:
+                kwargs[name] = raw_values[canonical]
+                used_map[canonical] = name
+                break
+
+    log.info("Param map: %s", ", ".join(f"{k}->{v}" for k, v in used_map.items()) or "None")
+    return recommend(**kwargs)  # type: ignore[misc]
+
+
+# ---------------------------------- API --------------------------------------
 @app.get("/recommend")
 def api_recommend(
-    budget: float = Query(..., description="Total budget in £m (e.g., 12.5)"),
-    need: str = Query(..., description='Positions like "2:1,3:1" (1=GK,2=DEF,3=MID,4=FWD)'),
-    exclude: str = Query("", description="Comma-separated player IDs already in your squad"),
-    max_from_team: int = Query(3, ge=1, le=3),
-    top_per_pos: int = Query(30, ge=1, le=100),
-):
-    need_positions = _parse_positions(need)
-    exclude_ids = _parse_ids(exclude)
-
-    # Fetch with 15-min disk cache
-    try:
-        bootstrap = cache_json("cache_bootstrap.json", 15*60, fetch_bootstrap_static)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch FPL bootstrap-static: {e}")
-    try:
-        throttle(0.2)
-        fixtures = cache_json("cache_fixtures.json", 15*60, fetch_fixtures)
-    except Exception:
-        fixtures = []  # fallback: fixture_outlook -> 0.0
-
-    # Build player frame & compute recommendations
-    try:
-        df = build_player_frame(bootstrap, fixtures)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to build player frame: {e}")
-
-    try:
-        rec = recommend(
-            df=df,
-            budget=budget,
-            need_positions=need_positions,
-            exclude_ids=exclude_ids,
-            max_from_team=max_from_team,
-            top_k_per_pos=top_per_pos,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to compute recommendations: {e}")
-
-    if rec.empty:
-        return {"recommendations": [], "spent": 0.0, "count": 0}
-
-    # ---- JSON-safe response prep ----
-    cols = ["id","web_name","team_name","pos","price","score","form","points_per_game","fixture_outlook","chance_of_playing_next_round"]
-    for c in cols:
-        if c not in rec.columns:
-            rec[c] = None
-    pretty = rec.loc[:, cols].copy()
-
-    # Coerce numerics & compute 'value'
-    pretty["price"] = pd.to_numeric(pretty["price"], errors="coerce")
-    pretty["points_per_game"] = pd.to_numeric(pretty["points_per_game"], errors="coerce")
-    pretty["score"] = pd.to_numeric(pretty.get("score", 0), errors="coerce")
-    pretty["form"] = pd.to_numeric(pretty.get("form", 0), errors="coerce")
-    pretty["fixture_outlook"] = pd.to_numeric(pretty.get("fixture_outlook", 0), errors="coerce")
-
-    denom = pretty["price"].replace(0, np.nan)
-    pretty["value"] = (pretty["points_per_game"] / denom)
-
-    # Round numerics
-    for c in ["price","score","form","points_per_game","fixture_outlook","value"]:
-        pretty[c] = pd.to_numeric(pretty[c], errors="coerce").round(2)
-
-    # Hard-sanitize every cell to JSON-safe primitives
-    def clean(v):
-        try:
-            if pd.isna(v):
-                return None
-        except Exception:
-            pass
-        if hasattr(v, "item"):
-            try:
-                v = v.item()
-            except Exception:
-                pass
-        if isinstance(v, (float, int)):
-            try:
-                if not math.isfinite(float(v)):
-                    return None
-            except Exception:
-                return None
-        return v
-
-    recommendations = [{k: clean(v) for k, v in row.items()}
-                       for row in pretty.to_dict(orient="records")]
-
-    # Safe spend
-    spent_series = pd.to_numeric(rec["price"], errors="coerce")
-    spent = float(spent_series.fillna(0).sum())
-    if not math.isfinite(spent):
-        spent = 0.0
-    spent = round(spent, 2)
-
-    return {"recommendations": recommendations, "spent": spent, "count": int(len(recommendations))}
-
-# ---------------- Recommend (CSV download) ----------------
-@app.get("/recommend.csv")
-def recommend_csv(
+    request: Request,
     budget: float = Query(...),
     need: str = Query(...),
     exclude: str = Query(""),
     max_from_team: int = Query(3, ge=1, le=3),
     top_per_pos: int = Query(30, ge=1, le=100),
+    format: str | None = Query(None),
+    compact: bool = Query(True, description="Return compact fields for UI"),   # <— NEW
 ):
-    data = api_recommend(budget, need, exclude, max_from_team, top_per_pos)
-    recs = data.get("recommendations", [])
-    output = io.StringIO()
-    fieldnames = ["id","web_name","team_name","pos","price","score","form","points_per_game","fixture_outlook","chance_of_playing_next_round","value"]
-    writer = csv.DictWriter(output, fieldnames=fieldnames)
-    writer.writeheader()
-    for r in recs:
-        writer.writerow({k: r.get(k, "") for k in fieldnames})
-    output.seek(0)
-    return StreamingResponse(
-        output,
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=recommendations.csv"},
-    )
+
+    if recommend is None:
+        raise HTTPException(status_code=500, detail="Recommender function not found.")
+
+    df = _get_df()
+    if df is None:
+        raise HTTPException(status_code=500, detail="Dataframe not loaded.")
+
+    need_positions = _parse_positions(need)
+    exclude_ids = _parse_ids(exclude)
+
+    try:
+        raw = _adapt_and_call_recommend(
+            df=df,
+            budget=budget,
+            need_positions=need_positions,
+            exclude_ids=exclude_ids,
+            max_from_team=max_from_team,
+            top_per_pos=top_per_pos,
+        )
+        rows = _normalize_rows(raw)
+        if compact:
+            rows = [_compact_row(r) for r in rows]
+
+        log.info("Generated %d rows", len(rows))
+    except Exception as e:
+        log.exception("Recommendation error")
+        raise HTTPException(status_code=500, detail=f"Recommendation error: {e}") from e
+
+    if _wants_csv(request, format):
+        csv_text = _to_csv(rows)
+        return PlainTextResponse(
+            content=csv_text,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="recommendations.csv"'},
+        )
+
+    return JSONResponse(_json_sanitize({"items": rows}))
